@@ -1,0 +1,151 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Alarm Notification Lambda Application
+
+Parameters:
+  Environment:
+    Type: String
+    Description: Where this deployment should point to
+    Default: dev
+    AllowedValues:
+      - dev
+      - qa
+      - uat
+      - prod
+  Project:
+    Type: String
+    Description: Project name where this deployment belongs to
+    Default: user-managed
+  EcsServiceName:
+    Type: String
+    Description: ECS Service name where the application is running
+    Default: user-managed
+  EcsClusterName:
+    Type: String
+    Description: ECS Cluster name where the application is running
+
+Resources:
+  AlarmNotificationLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "alarm-notification-lambda-${Environment}"
+      Role: !GetAtt AlarmNotificationLambdaRole.Arn
+      MemorySize: 512
+      Environment:
+        Variables:
+          LAMBDA_SLACK_WEBHOOK: !Sub "{{resolve:secretsmanager:/${Environment}/${Project}/LAMBDA_SLACK_WEBHOOK:SecretString:SLACK_WEBHOOK}}"
+          LAMBDA_SLACK_PROJECT: !Ref Project
+      Handler: "main.alarm_notifications_handler"
+      CodeUri: "./package.zip"
+      Runtime: "python3.9"
+      Layers:
+        - !Ref AlarmNotificationLambdaLayer
+      Architectures:
+        - "x86_64"
+      Tags:
+        environment: !Ref Environment
+        project: !Ref Project
+        name: !Sub "alarm-notification-lambda-${Environment}"
+
+  AlarmNotificationLambdaLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      CompatibleArchitectures:
+        - "x86_64"
+      CompatibleRuntimes:
+        - "python3.9"
+      LayerName: !Sub "alarm-lambda-dependencies-layer-${Environment}"
+      Description: "Alarm Layer where the dependencies will be installed"
+      Content:
+        S3Bucket: "alarm-lambda-dependencies"
+        S3Key: "lambda-dependencies.zip"
+
+  AlarmNotificationLambdaAlias:
+    Type: AWS::Lambda::Alias
+    Properties:
+      FunctionName: !Ref AlarmNotificationLambda
+      FunctionVersion: "$LATEST"
+      Name: live
+
+  AlarmNotificationLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "AlarmNotificationLambdaRole-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Path: "/"
+      Tags:
+        - Key: "environment"
+          Value: !Ref Environment
+        - Key: "project"
+          Value: !Ref Project
+        - Key: "name"
+          Value: !Sub "AlarmNotificationLambdaExecutionRole-${Environment}"
+
+  AlarmNotificationLambdaPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: "ReadSlackCredentialsSecret"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Action: "secretsmanager:GetSecretValue"
+            Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:*"
+      Roles:
+        - Ref: "AlarmNotificationLambdaRole"
+
+  AlarmSnsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "alarm-sns-topic-${Environment}"
+      Subscription:
+        - Protocol: "lambda"
+          Endpoint: !GetAtt AlarmNotificationLambda.Arn
+      Tags:
+        - Key: "environment"
+          Value: !Ref Environment
+        - Key: "project"
+          Value: !Ref Project
+        - Key: "name"
+          Value: !Sub "alarm-sns-topic-${Environment}"
+
+  AlarmLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !Ref AlarmNotificationLambda
+      Principal: "sns.amazonaws.com"
+      SourceArn: !Ref AlarmSnsTopic
+
+  EcsTaskExecutionAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmActions:
+        - !Ref AlarmSnsTopic
+      OKActions:
+        - !Ref AlarmSnsTopic
+      AlarmDescription: "ECS Task Execution Alarm"
+      AlarmName: !Sub "EcsTaskExecutionAlarm-${Environment}"
+      Namespace: AWS/ECS
+      MetricName: CPUUtilization
+      Statistic: SampleCount
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 2
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: ServiceName
+          Value: !Ref EcsServiceName
+        - Name: ClusterName
+          Value: !Ref EcsClusterName
